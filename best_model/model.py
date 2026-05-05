@@ -7,20 +7,20 @@ index_to_symbol = {i: s for s, i in symbol_to_index.items()}
 num_classes = len(symbols)  # Количество классов (включая blank)
 
 print(f"Количество символов в словаре: {num_classes}")
-print(symbols)
-print(symbol_to_index)
-print(index_to_symbol)
+
+def clean_text(text, allowed_chars):
+    """Удаляет из текста все символы, которых нет в словаре"""
+    return ''.join([c for c in text if c in allowed_chars])
+
 def text_to_labels(text, symbol_to_index):
-    labels = []
-    for char in text.lower(): # или text.upper() если регистр важен.
-        labels.append(symbol_to_index[char])
+    allowed = set(symbol_to_index.keys())
+    text = ''.join([c if c in allowed else ' ' for c in text.lower()])
+    # заменяем неизвестные символы на пробел, но пробелы НЕ УДАЛЯЕМ
+    text = " ".join(text.split())  # нормализуем множественные пробелы
+    labels = [symbol_to_index[c] for c in text]
     return labels
 
-# Пример:
-text = "hello world"
-labels = text_to_labels(text, symbol_to_index)
-print(f"Текст: {text}")
-print(f"Метки: {labels}")
+
 import os
 import torch
 from torch.utils.data import Dataset
@@ -34,7 +34,7 @@ def is_image_file(filename):
 
 
 class LipReadingDataset(Dataset):
-    def __init__(self, root_dir, split='train', transform=None, symbol_to_index=None, max_len=25):
+    def __init__(self, root_dir, split='train', transform=None, symbol_to_index=None, max_len=168):
         """
         Args:
             root_dir (string): Directory with the dataset.
@@ -93,11 +93,12 @@ class LipReadingDataset(Dataset):
 
     def __getitem__(self, idx):
         image_paths = self.sequences[idx]
+        orig_len = len(image_paths)
         images = []
 
         for image_path in image_paths:
             try:
-                image = Image.open(image_path).convert('RGB')
+                image = Image.open(image_path).convert('L')
             except FileNotFoundError:
                 print(f"Error: Image not found: {image_path}")
                 raise  # Re-raise the exception so it's not silently ignored.
@@ -119,7 +120,7 @@ class LipReadingDataset(Dataset):
         text = self.labels[idx]
         labels = torch.tensor(text_to_labels(text, self.symbol_to_index), dtype=torch.long)
 
-        return sequence, labels
+        return sequence, labels, orig_len
 
 import torch
 from torch.nn.utils.rnn import pad_sequence
@@ -132,7 +133,7 @@ def collate_fn(batch, padding_value=0):
     - input_lengths: (B) - lengths of input sequences
     - target_lengths: (B) - lengths of target sequences
     """
-    sequences, labels = zip(*batch)
+    sequences, labels, orig_lengths = zip(*batch)
 
     # Длины меток
     target_lengths = torch.tensor([len(label) for label in labels], dtype=torch.long)
@@ -144,7 +145,10 @@ def collate_fn(batch, padding_value=0):
     padded_sequences = torch.stack(sequences)
 
     # Длина входа (предполагаем, что они все одинаковой длины после обработки CNN)
-    input_lengths = torch.full(size=(len(sequences),), fill_value=padded_sequences.size(1), dtype=torch.long)
+    input_lengths = torch.tensor(
+        [min(l, padded_sequences.size(1)) for l in orig_lengths],
+        dtype=torch.long
+    )
 
     return padded_sequences, targets, input_lengths, target_lengths
 
@@ -153,37 +157,31 @@ from torchvision import transforms
 
 data_transforms = {
     'train': transforms.Compose([
-        transforms.RandomApply([
-            transforms.RandomRotation(10),
-            transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
-            transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05))
-        ], p=0.5), # Применяем аугментации с вероятностью 50%
         transforms.Resize((96, 96)),
-        transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.6887, 0.4695, 0.3116], std=[0.0822, 0.0952, 0.0584])
+        transforms.Normalize(mean=[0.5], std=[0.5])
     ]),
     'val': transforms.Compose([
         transforms.Resize((96, 96)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.6887, 0.4695, 0.3116], std=[0.0822, 0.0952, 0.0584])
+        transforms.Normalize(mean=[0.5], std=[0.5])
     ]),
     'test': transforms.Compose([
         transforms.Resize((96, 96)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.6887, 0.4695, 0.3116], std=[0.0822, 0.0952, 0.0584])
+        transforms.Normalize(mean=[0.5], std=[0.5])
     ])
 }
 
-root_dir = "Lip_reading/dataset_lips/dataset_lips_cropped"
+root_dir = "/kaggle/input/lip-reading-dataset/final_dataset"
 
 image_datasets = {
     'train': LipReadingDataset(root_dir, split='train', transform=data_transforms['train'],
-                               symbol_to_index=symbol_to_index, max_len=25),
+                               symbol_to_index=symbol_to_index, max_len=168),
     'val': LipReadingDataset(root_dir, split='val', transform=data_transforms['val'],
-                             symbol_to_index=symbol_to_index, max_len=25),
+                             symbol_to_index=symbol_to_index, max_len=168),
     'test': LipReadingDataset(root_dir, split='test', transform=data_transforms['test'],
-                              symbol_to_index=symbol_to_index, max_len=25)
+                              symbol_to_index=symbol_to_index, max_len=168)
 }
 
 
@@ -191,7 +189,7 @@ image_datasets = {
 dataloaders = {
     x: DataLoader(
         image_datasets[x],
-        batch_size=32,
+        batch_size=8,
         shuffle=(x=='train'),  # перемешиваем только для train
         num_workers=4,          # количество параллельных потоков для загрузки
         collate_fn=collate_fn # если используешь CTC
@@ -215,109 +213,81 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class LipReadingGRU3DCNN(nn.Module):
-    def __init__(self, num_classes, gru_hidden_size=256, gru_layers=2, dropout=0.5):
-        super(LipReadingGRU3DCNN, self).__init__()
+class LipReading3DCNN(nn.Module):
+    def __init__(self, num_classes, lstm_hidden_size=256, lstm_layers=2, dropout=0.2):
+        super().__init__()
+
         # --- 3D CNN ---
-        self.conv1 = nn.Conv3d(3, 64, kernel_size=(3,3,3), padding=(1,1,1))
+        self.conv1 = nn.Conv3d(1, 64, 3, padding=1)
         self.bn1 = nn.BatchNorm3d(64)
-        self.pool1 = nn.MaxPool3d(kernel_size=(1,2,2), stride=(1,2,2))
-        self.dropout3d1 = nn.Dropout3d(dropout)
+        self.pool1 = nn.MaxPool3d((1,2,2))
 
-        self.conv2 = nn.Conv3d(64, 128, kernel_size=(3,3,3), padding=(1,1,1))
+        self.conv2 = nn.Conv3d(64, 128, 3, padding=1)
         self.bn2 = nn.BatchNorm3d(128)
-        self.pool2 = nn.MaxPool3d(kernel_size=(1,2,2), stride=(1,2,2))
-        self.dropout3d2 = nn.Dropout3d(dropout)
+        self.pool2 = nn.MaxPool3d((2,2,2))
 
-        self.conv3 = nn.Conv3d(128, 256, kernel_size=(3,3,3), padding=(1,1,1))
+        self.conv3 = nn.Conv3d(128, 256, 3, padding=1)
         self.bn3 = nn.BatchNorm3d(256)
-        self.pool3 = nn.MaxPool3d(kernel_size=(1,2,2), stride=(1,2,2))
-        self.dropout3d3 = nn.Dropout3d(dropout)
+        self.pool3 = nn.MaxPool3d((1,2,2))
 
-        self.cnn_output_size = 256  # теперь 256 каналов для GRU
+        self.dropout3d = nn.Dropout3d(dropout)
 
-        # --- Bidirectional GRU ---
-        self.gru1 = nn.GRU(
+        # --- LSTM ---
+        # после adaptive pooling H=W=2, C=128
+        self.cnn_output_size = 256 * 2 * 2
+
+        self.lstm = nn.LSTM(
             input_size=self.cnn_output_size,
-            hidden_size=gru_hidden_size,
-            num_layers=1,
+            hidden_size=lstm_hidden_size,
+            num_layers=lstm_layers,
             batch_first=True,
-            bidirectional=True
+            bidirectional=True,
+            dropout=dropout
         )
-        self.gru2 = nn.GRU(
-            input_size=gru_hidden_size * 2,
-            hidden_size=gru_hidden_size,
-            num_layers=1,
-            batch_first=True,
-            bidirectional=True
-        )
-        self.dropout = nn.Dropout(dropout)
 
-        # --- Fully connected output ---
-        self.fc = nn.Linear(gru_hidden_size * 2, num_classes)
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(lstm_hidden_size*2, num_classes)
         self.log_softmax = nn.LogSoftmax(dim=2)
 
-    def forward(self, x, target_lengths=None):
-        """
-        x: (B, T, C, H, W)
-        target_lengths: tensor с длинами целевых последовательностей (для интерполяции)
-        """
-        B = x.size(0)
+    def forward(self, x, input_lengths=None):
+        # (B, C=1, T, H, W) → (B, T, C, H, W)
+        # x = x.permute(0, 2, 1, 3, 4)
 
         # --- 3D CNN ---
-        x = x.permute(0, 2, 1, 3, 4)  # (B, C, T, H, W)
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = self.dropout3d1(x)
-        x = self.pool1(x)
+        x = self.pool1(F.relu(self.bn1(self.conv1(x))))
+        x = self.pool2(F.relu(self.bn2(self.conv2(x))))
+        x = self.pool3(F.relu(self.bn3(self.conv3(x))))
+        x = self.dropout3d(x)
 
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = self.dropout3d2(x)
-        x = self.pool2(x)
+        # --- Adaptive pooling по H,W (оставляем T) ---
+        T = x.shape[2]
+        x = F.adaptive_avg_pool3d(x, (T, 2, 2))  # H=W=2
 
-        x = F.relu(self.bn3(self.conv3(x)))
-        x = self.dropout3d3(x)
-        x = self.pool3(x)
+        B, C, T, H, W = x.shape
+        T_out = T
 
-        # --- Spatial avg pooling ---
-        x = x.mean(dim=(3,4), keepdim=True)  # (B, C, T', 1, 1)
-        x = x.squeeze(-1).squeeze(-1)        # (B, C, T')
-        x = x.permute(0, 2, 1)               # (B, T', C)
+        # --- разворачиваем spatial ---
+        x = x.permute(0, 2, 1, 3, 4)   # (B, T, C, H, W)
+        x = x.reshape(B, T, C * H * W) # (B, T, features)
 
-        # --- Temporal upsampling (если нужно) ---
-        if target_lengths is not None:
-            max_target_length = target_lengths.max().item()
-            if x.shape[1] < max_target_length:
-                x = F.interpolate(
-                    x.permute(0,2,1),  # (B, C, T')
-                    size=max_target_length,
-                    mode='linear',
-                    align_corners=False
-                ).permute(0,2,1)      # обратно (B, T', C)
+        # --- LSTM ---
+        lstm_out, _ = self.lstm(x)
+        lstm_out = self.dropout(lstm_out)
 
-        # --- GRU layers ---
-        gru_out, _ = self.gru1(x)
-        gru_out = self.dropout(gru_out)
-        gru_out, _ = self.gru2(gru_out)
-        gru_out = self.dropout(gru_out)
+        # --- классификация ---
+        output = self.fc(lstm_out)
+        output = self.log_softmax(output)
 
-        # --- Fully connected + log softmax ---
-        output = self.fc(gru_out)
-        output = self.log_softmax(output)  # (B, T', num_classes)
-
-        T_out = x.shape[1]
         return output, T_out
 
-def visualize_predictions(model, val_dataloader, index_to_symbol, device, num_batches=1):
+def visualize_predictions(model, val_dataloader, index_to_symbol, device, num_batches=1, num_examples=5):
     model.eval()
+    examples_shown = 0
     with torch.no_grad():
         for batch_idx, (data, targets, _, target_lengths) in enumerate(val_dataloader):
-            if batch_idx >= num_batches:
-                break
-
             data = data.to(device)
-            # Распаковываем output и T_out
-            output, T_out = model(data)        # теперь модель возвращает кортеж
-            output = output.transpose(0, 1)    # -> (T', B, C)
+            output, T_out = model(data)
+            output = output.transpose(0, 1)  # T', B, C
 
             batch_size = data.size(0)
             input_lengths = torch.full(
@@ -330,7 +300,7 @@ def visualize_predictions(model, val_dataloader, index_to_symbol, device, num_ba
             # Декодируем предсказания
             predicted_texts = decode_predictions(output.cpu(), index_to_symbol, input_lengths.cpu())
 
-            # Преобразуем индексы целей в текст
+            # Целевые тексты
             reference_texts = []
             start = 0
             for length in target_lengths:
@@ -338,11 +308,16 @@ def visualize_predictions(model, val_dataloader, index_to_symbol, device, num_ba
                 reference_texts.append(reference_text)
                 start += length
 
-            # Выводим первые примеры
-            for i in range(batch_size):
+            # Выбираем случайные примеры из батча
+            indices = list(range(batch_size))
+            random.shuffle(indices)
+            for i in indices:
                 print(f"Reference : {reference_texts[i]}")
                 print(f"Predicted : {predicted_texts[i]}")
                 print("-" * 30)
+                examples_shown += 1
+                if examples_shown >= num_examples:
+                    return
 
 import jiwer
 import torch
@@ -448,8 +423,14 @@ model = LipReading3DCNN(num_classes).to(device)  # инициализация м
 # --- Оптимизатор с маленькой скоростью обучения ---
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
-# --- Scheduler: уменьшаем lr каждые 5 эпох на 20% ---
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.8)
+scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer,
+                max_lr=1e-3,
+                epochs=num_epochs,
+                steps_per_epoch=len(dataloaders['train']),
+                pct_start=0.1,
+                div_factor=20,          # стартовый lr=3e-4
+                final_div_factor=50     # конечный lr=6e-5
+                )
 
 criterion = nn.CTCLoss(blank=0, reduction='mean', zero_infinity=True)
 best_val_loss = float('inf')
@@ -460,14 +441,28 @@ epochs_no_improve = 0
 for epoch in range(num_epochs):
     model.train()
     train_loss = 0.0
-    for batch_idx, (data, targets, _, target_lengths) in enumerate(dataloaders['train']):
+
+    for batch_idx, (data, targets, input_lengths, target_lengths) in enumerate(dataloaders['train']):
+        batch_size = data.size(0)
+
         data = data.to(device)
+
+        # --- Fix input shape ---
+        if data.ndim == 4:
+            # (B, T, H, W) → (B, 1, T, H, W)
+            data = data.unsqueeze(1)
+
+        elif data.ndim == 5 and data.shape[1] not in (1, 3):
+            # (B, T, C, H, W) → (B, C, T, H, W)
+            data = data.permute(0, 2, 1, 3, 4)
+
         targets = targets.to(device)
         target_lengths = target_lengths.to(device)
 
-        optimizer.zero_grad()
-        output, T_out = model(data, target_lengths=target_lengths)
-        output = output.transpose(0, 1)  # (T', B, num_classes)
+        optimizer.zero_grad(set_to_none=True)
+
+        output, T_out = model(data)  # output: (B, T', num_classes)
+        output = output.transpose(0, 1)  # -> (T', B, num_classes) для CTCLoss
 
         input_lengths = torch.full(
             size=(data.size(0),),
@@ -478,32 +473,33 @@ for epoch in range(num_epochs):
 
         loss = criterion(output, targets, input_lengths, target_lengths)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        scheduler.step()
 
-        train_loss += loss.item()
-        if (batch_idx + 1) % 500 == 0:
+        if (batch_idx + 1) % 100 == 0:  # вывод каждые 10 батчей
             print(f"[Epoch {epoch + 1}] Batch {batch_idx + 1}/{len(dataloaders['train'])} - Loss: {loss.item():.4f}")
 
-    train_loss /= len(dataloaders['train'])
+        train_loss += loss.item()
 
-    # --- Валидация ---
+    train_loss /= len(dataloaders['train'])
     val_loss, cer, wer = validate(model, dataloaders['val'], criterion, device, index_to_symbol)
     print(
         f"Эпоха {epoch + 1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, CER: {cer:.4f}, WER: {wer:.4f}")
+
+    # После валидации
     visualize_predictions(model, dataloaders['val'], index_to_symbol, device, num_batches=1)
 
-    # --- Сохраняем лучшую модель ---
+    # Сохраняем лучшую модель
     if val_loss < best_val_loss:
         best_val_loss = val_loss
         torch.save(model.state_dict(), "best_model.pth")
-        epochs_no_improve = 0
+        epochs_no_improve = 0  # сбрасываем счётчик
         print(f"Новая лучшая модель сохранена (Val Loss: {val_loss:.4f})")
     else:
         epochs_no_improve += 1
         print(f"Val loss не улучшился {epochs_no_improve} эпох(и) подряд")
 
-    # --- Сохраняем чекпоинт ---
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -511,9 +507,7 @@ for epoch in range(num_epochs):
         'best_val_loss': best_val_loss,
     }, "checkpoint.pth")
 
-    # --- Scheduler шаг ---
-    scheduler.step()
-
+    # если несколько эпох подряд без улучшения — останавливаем
     if epochs_no_improve >= patience:
         print(f"Ранняя остановка: нет улучшения {patience} эпох подряд.")
         break
