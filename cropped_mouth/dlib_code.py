@@ -1,12 +1,14 @@
 import cv2
 import dlib
+import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 
+
 # === Пути ===
-DATASET_ROOT = Path(r"C:\Data\Projects\magistratura\MIRACLE\dataset")  # исходные изображения
-OUTPUT_ROOT = Path(r"C:\Data\Projects\magistratura\MIRACLE\dataset_cropped")  # куда сохранять
-FAILED_IMAGES_PATH = Path(r"C:\Data\Projects\magistratura\MIRACLE\failed_images.txt")  # файл для ошибок
+SOURCE_ROOT = Path(r"D:\bbac2a_again_1700")
+OUTPUT_ROOT = Path(r"D:\bbac2a_again_1700\dataset_lips_cropped")
+BAD_FILES_PATH = Path(r"D:\bbac2a_again_1700\bad_files_cropping.txt")
 
 # === Dlib модели ===
 detector = dlib.get_frontal_face_detector()
@@ -14,78 +16,79 @@ predictor = dlib.shape_predictor(
     r"C:\Data\Projects\magistratura\cropped_mouth\shape_predictor_68_face_landmarks.dat"
 )
 
-# Настройки
-PADDING = 5
-SIZE = (96, 96)
-ALPHA = 1.5         # контраст (1.0 = без изменений)
-BETA = -10          # яркость
+# # === Настройки ===
+PAD = 10  # отступ вокруг рта
+SIZE = (96, 96)  # размер результирующего изображения
 
-# --- Открываем файл для логирования ---
-failed_file = open(FAILED_IMAGES_PATH, "w", encoding="utf-8")
+# === Подготовка файла ошибок ===
+bad_files = open(BAD_FILES_PATH, "a", encoding="utf-8")
 
-# --- Рекурсивный поиск всех изображений ---
-all_images = list(DATASET_ROOT.rglob("*.jpg")) + list(DATASET_ROOT.rglob("*.png"))
-print(f"Найдено {len(all_images)} изображений для обработки.")
-
-for image_path in tqdm(all_images, desc="Обработка изображений"):
+def process_image(image_path: Path):
+    """Обрезает губы и сохраняет в новый датасет"""
     try:
-        if not image_path.exists():
-            failed_file.write(f"{image_path}\n")
-            continue
+        # --- Пропуск, если файл уже существует ---
+        rel_path = image_path.relative_to(SOURCE_ROOT)
+        output_path = OUTPUT_ROOT / rel_path
+        if output_path.exists():
+            return  # уже обработан
 
+        # --- Загрузка изображения ---
         img = cv2.imread(str(image_path))
         if img is None:
-            failed_file.write(f"{image_path}\n")
-            continue
+            bad_files.write(f"Ошибка загрузки: {image_path}\n")
+            return
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-        # --- Обнаружение лиц ---
-        faces = detector(gray, 0)
+        faces = detector(gray, 1)
         if len(faces) == 0:
-            failed_file.write(f"{image_path}\n")
-            continue
+            bad_files.write(f"Лицо не обнаружено: {image_path}\n")
+            return
 
-        # Берём первое лицо
-        face = faces[0]
-        shape = predictor(gray, face)
+        shape = predictor(gray, faces[0])
+        mouth_points = np.array([(shape.part(i).x, shape.part(i).y) for i in range(48, 68)])
+        x_min, y_min = np.min(mouth_points, axis=0)
+        x_max, y_max = np.max(mouth_points, axis=0)
 
-        # Координаты рта (точки 48-67)
-        mouth_points = [(shape.part(i).x, shape.part(i).y) for i in range(48, 68)]
-        x_min = max(0, min(p[0] for p in mouth_points) - PADDING)
-        y_min = max(0, min(p[1] for p in mouth_points) - PADDING)
-        x_max = min(img.shape[1], max(p[0] for p in mouth_points) + PADDING)
-        y_max = min(img.shape[0], max(p[1] for p in mouth_points) + PADDING)
+        # Добавляем отступ и проверяем границы
+        x_min = max(0, x_min - PAD)
+        y_min = max(0, y_min - PAD)
+        x_max = min(img.shape[1], x_max + PAD)
+        y_max = min(img.shape[0], y_max + PAD)
 
         if x_max <= x_min or y_max <= y_min:
-            failed_file.write(f"{image_path}\n")
-            continue
+            bad_files.write(f"Некорректная область: {image_path}\n")
+            return
 
         mouth_crop = img[y_min:y_max, x_min:x_max]
         if mouth_crop.size == 0:
-            failed_file.write(f"{image_path}\n")
-            continue
+            bad_files.write(f"Пустое изображение: {image_path}\n")
+            return
 
-        scale_factor = 1.5  # увеличиваем всё лицо перед обрезкой
-        img = cv2.resize(img, (int(img.shape[1] * scale_factor), int(img.shape[0] * scale_factor)),
-                         interpolation=cv2.INTER_CUBIC)
+        mouth_resized = cv2.resize(mouth_crop, SIZE)
 
-        mouth_resized = cv2.resize(mouth_crop, SIZE, interpolation=cv2.INTER_CUBIC)
-
-        # mouth_enhanced = cv2.convertScaleAbs(mouth_resized, alpha=ALPHA, beta=BETA)
-
-
-        # --- Сохраняем ---
-        rel_path = image_path.relative_to(DATASET_ROOT)
-        output_path = OUTPUT_ROOT / rel_path
+        # --- Сохранение ---
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(output_path), mouth_resized, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-
+        cv2.imwrite(str(output_path), mouth_resized)
 
     except Exception as e:
-        failed_file.write(f"{image_path}\n")
-
-failed_file.close()
-print(f"\nОбработка завершена. Неудачные изображения сохранены в {FAILED_IMAGES_PATH}")
+        bad_files.write(f"Ошибка {type(e).__name__}: {image_path} — {e}\n")
 
 
+# === Основной цикл ===
+splits = ["train", "val", "test"]
+
+for split in splits:
+    split_dir = SOURCE_ROOT / split
+    if not split_dir.exists():
+        print(f"Пропущен {split_dir} — не найден.")
+        continue
+
+    all_images = list(split_dir.rglob("*.jpg"))
+    print(f"\nОбработка сплита {split}: найдено {len(all_images)} изображений")
+
+    for img_path in tqdm(all_images, desc=f"{split}"):
+        process_image(img_path)
+
+
+bad_files.close()
+print(f"\n Обрезка завершена. Ошибки сохранены в {BAD_FILES_PATH}")
