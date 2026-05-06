@@ -421,7 +421,7 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 model = LipReading3DCNN(num_classes).to(device)  # инициализация модели с 3D CNN
 
 # --- Оптимизатор с маленькой скоростью обучения ---
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
 scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer,
                 max_lr=1e-3,
